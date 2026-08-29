@@ -1,0 +1,55 @@
+const int Trigger = 2;   // Pin digital 2 para el Trigger del sensor
+const int Echo = 3;      // Pin digital 3 para el Echo del sensor
+
+void setup() {
+  // Inicializa el puerto USB para la consola de tu PC
+  Serial.begin(9600);
+ 
+  // Inicializa la comunicacion con la Raspberry Pi por los pines fisicos 18 y 19
+  Serial1.begin(9600);
+ 
+  pinMode(Trigger, OUTPUT);
+  pinMode(Echo, INPUT);  
+  digitalWrite(Trigger, LOW);
+ 
+  Serial.println("--- ARDUINO READY: ULTRASONICO EN PINES 2 Y 3 ---");
+}
+
+void loop() {
+  // El Arduino responde bajo demanda de la Raspberry Pi usando Serial1
+  if (Serial1.available() > 0) {
+    char orden = Serial1.read(); // Captura la orden enviada por Python desde la Raspberry
+   
+    if (orden == 'E') {
+      long t; // tiempo que demora en llegar el eco
+      long d; // distancia en centimetros
+
+      digitalWrite(Trigger, HIGH);
+      delayMicroseconds(10);          // Enviamos un pulso de 10us
+      digitalWrite(Trigger, LOW);
+     
+      t = pulseIn(Echo, HIGH, 30000); // Timeout de 30ms por si el sensor no responde
+     
+      if (t == 0) {
+        Serial1.println("ERROR_LECTURA");
+        Serial.println("[Alerta Local] Error: No se pudo leer el sensor ultrasonico.");
+      }
+      else {
+        d = t / 59; // escalamos el tiempo a una distancia en cm
+       
+        // Enviamos la distancia directamente a la Raspberry Pi por Serial1
+        Serial1.println(d);
+
+        // Respaldo visual en el Monitor Serie de tu PC (USB)
+        Serial.print("Solicitud procesada con exito. Distancia enviada: ");
+        Serial.print(d);
+        Serial.println(" cm");
+      }
+    }
+    else if (orden == 'A') {
+      // Si la orden de la Raspberry Pi es detenerse (Modo Standby horario)
+      Serial1.println("SENSORES_APAGADOS");
+      Serial.println("[Modo Reposo] Confirmado y activado por orden del maestro.");
+    }
+  }
+}
