@@ -1,0 +1,131 @@
+!pip install flask pyngrok
+import os # Crea carpetas , verifican si existen archivos y gestiona ruyas de
+almacenamiento en el disco.
+import sqlite3 # Crea, gestiona y consulta bases de datos sin necesidad de instalar un servidor externo.
+import pandas as pd # Manipula y analiza datos estructurados en forma de tabla.
+import numpy as np # Crea arreglo de datos , operaciones matematicas rapidas y
+transformacion ciclicas de tiempo.
+import tensorflow as tf # Plataforma principa de Inteligencia Artificial
+desarrollada por Google.
+from tensorflow.keras.models import Sequential, load_model # Estructura el modelo de red neuronal paso a paso y carga en memoria un modelo que ya haya sido entrenado previamente.
+from tensorflow.keras.layers import GRU, Dense, Dropout, Input # Define la arquitectura de la red predictiva.
+from sklearn.preprocessing import MinMaxScaler # Transforma y normaliza los valores numericos a un rango entre 0 y 1. 
+from flask import Flask, request, jsonify # Crea una API web ligera en Python para recibir las peticiones con datos de los sensores, procesarlas y devolver las predicciones.
+from pyngrok import ngrok # Abre un tunel seguro a internet desde la Raspberry Pi.
+
+app = Flask(__name__)
+app.view_functions.clear()
+
+# Configurar Ngrok
+ngrok.set_auth_token("3I5wYYRONwl9NuVKVFqaKxFn34V_6zMhj9gEa6vAdxrUuKKqL")
+ngrok.kill()
+
+public_url = ngrok.connect(5000)
+
+print("====================================================")
+print(" URL AUTOMATIZADA PARA RASPBERRY PI:")
+print(f"{public_url.public_url}/entrenar_ia")
+print("====================================================")
+
+MODELO_PATH = "modelo_estacionamiento.keras"
+
+def procesar_tiempos_ocupacion(df):
+    df['ocupado'] = (df['dist_e1'] < 50.0).astype(int)
+    df['bloque'] = (df['ocupado'] != df['ocupado'].shift()).cumsum()
+
+    df_ocupado = df[df['ocupado'] == 1].copy()
+
+    if df_ocupado.empty:
+        return None, None, None
+
+    # Cada registro se asume de 30 segundos = 0.5 min
+    df_ocupado['tiempo_transcurrido'] = df_ocupado.groupby('bloque').cumcount() * 0.5
+    duracion_total = df_ocupado.groupby('bloque')['tiempo_transcurrido'].transform('max')
+    df_ocupado['minutos_faltantes'] = duracion_total - df_ocupado['tiempo_transcurrido']
+
+    X = df_ocupado[['tiempo_transcurrido']].values
+    y = df_ocupado[['minutos_faltantes']].values
+
+    return X, y, df_ocupado
+
+@app.route('/entrenar_ia', methods=['POST'])
+def recibir_y_predecir_auto():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file received"}), 400
+
+    file = request.files['file']
+    file.save("db_recibida.db")
+
+    conn = sqlite3.connect("db_recibida.db")
+    df = pd.read_sql_query("SELECT dist_e1 FROM monitoreo_estacionamiento", conn)
+    conn.close()
+
+    if df.empty:
+        return jsonify({"status": "warning", "msg": "Base de datos vacía"}), 200
+
+    # Procesar datos históricos de ocupacion
+    X_raw, y_raw, df_proc = procesar_tiempos_ocupacion(df)
+
+    if X_raw is None or len(X_raw) < 10:
+        return jsonify({
+            "status": "warning",
+            "msg": "No hay suficientes eventos de vehiculos para la IA."
+        }), 200
+
+    scaler_x = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+
+    X_scaled = scaler_x.fit_transform(X_raw)
+    y_scaled = scaler_y.fit_transform(y_raw)
+
+    ventana = 5
+    if len(X_scaled) <= ventana:
+        return jsonify({"status": "warning", "msg": "Muestras insuficientes."}), 200
+
+    X_seq, y_seq = [], []
+    for i in range(ventana, len(X_scaled)):
+        X_seq.append(X_scaled[i-ventana:i, 0])
+        y_seq.append(y_scaled[i, 0])
+
+    X_seq = np.array(X_seq)
+    y_seq = np.array(y_seq)
+    X_seq = np.reshape(X_seq, (X_seq.shape[0], X_seq.shape[1], 1))
+
+    # GESTION AUTOMÁTICA DEL MODELO
+    if os.path.exists(MODELO_PATH):
+        # 1. Cargar modelo guardado previamente (Inferencia ultra rapida)
+        modelo = load_model(MODELO_PATH)
+        # Ajuste fino muy rapido con los datos nuevos (2 épocas con batch mas grande)
+        modelo.fit(X_seq, y_seq, epochs=2, batch_size=32, verbose=0)
+    else:
+        # 2. Si es la primera vez que se ejecuta, crea y entrena el modelo base
+        print("\n[i] Creando y entrenando modelo base por primera vez...")
+        modelo = Sequential([
+            Input(shape=(X_seq.shape[1], 1)),
+            GRU(units=32, return_sequences=False),  # GRU es más ligero y rápido que LSTM
+            Dropout(0.1),
+            Dense(units=1)
+        ])
+        modelo.compile(optimizer='adam', loss='mean_squared_error')
+        modelo.fit(X_seq, y_seq, epochs=15, batch_size=32, verbose=0)
+
+    # Guardar estado del modelo en disco para la siguiente peticion
+    modelo.save(MODELO_PATH)
+
+    # Prediccion del tiempo restante para el vehiculo actual
+    ultima_secuencia = X_scaled[-ventana:]
+    ultima_secuencia = np.reshape(ultima_secuencia, (1, ventana, 1))
+
+    pred_scaled = modelo.predict(ultima_secuencia, verbose=0)
+    minutos_estimados = max(0.0, float(scaler_y.inverse_transform(pred_scaled)[0][0]))
+
+    print(f"Respuesta generada automáticamente: {minutos_estimados:.1f} min restantes.")
+
+    return jsonify({
+        "status": "success",
+        "minutos_faltantes_estimados": round(minutos_estimados, 1),
+        "mensaje": f"Se liberará en aprox. {round(minutos_estimados, 1)} minutos"
+    })
+
+if __name__ == '__main__':
+    app.run(port=5000)
