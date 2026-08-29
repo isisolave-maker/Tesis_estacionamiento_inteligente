@@ -1,0 +1,24 @@
+import serial # Sirve para gestionar la comunicacion serial entre dispositivos.
+import time # Sirve para manejar marcas de tiempo y controlar las pausas/retardos en el codigo.
+
+# Configuracion del puerto.
+# NOTA: '/dev/ttyACM0' es el nombre comun para Arduino en Raspberry Pi.
+try:
+    arduino = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+    time.sleep(2) # Espera 2 segundos a que el Arduino se reinicie correctamente
+    print("Conexion exitosa con Arduino Mega.")
+   
+    while True:
+        opcion = input("Escribe '1' para encender o '0' para apagar (Ctrl+C para salir): ")
+        if opcion in ['1', '0']:
+            arduino.write(opcion.encode()) # Convierte el texto a bytes y lo envia
+        else:
+            print("Opcion no valida.")
+
+except serial.SerialException as e:
+    print(f"Error de conexion: {e}")
+except KeyboardInterrupt:
+    print("\nPrograma finalizado.")
+finally:
+    if 'arduino' in locals() and arduino.is_open:
+        arduino.close()
