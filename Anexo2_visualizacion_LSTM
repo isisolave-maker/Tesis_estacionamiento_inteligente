@@ -1,0 +1,215 @@
+import warnings # Ocultar las advertencias molestas de NumPy en sistemas de 32 bits
+warnings.filterwarnings("ignore", category=UserWarning).
+import serial # Sirve para gestionar la comunicacion serial entre dispositivos.
+import time # Sirve para manejar marcas de tiempo y controlar las pausas/retardos en el codigo.
+import requests # Realiza peticiones HTTP a traves de internet.
+import sqlite3 #Permite interactuar con SQLite.
+from datetime import datetime, timedelta # Proporciona herramientas para manipular, formatear y hacer calculos con fechas y horas.
+import numpy as np # Biblioteca fundamental para el calculo numerico y manejo de vectores y matrices.
+import pandas as pd # Libreria para la manipulacion y analisis de datos.
+import tflite_runtime.interpreter as tflite # Carga en la memoria el archivo .tflite y ejecuta la inferencia local en tiempo real. 
+from sklearn.preprocessing import MinMaxScaler # # Libreria que escala y normaliza las variables numericas dentro de un rango determinado, usualmente entre 0 y 1. 
+
+# Configuracion usando los pines GPIO fisicos (Mapeado al puerto /dev/ttyS0)
+puerto_arduino = '/dev/ttyS0'
+archivo_db = '/home/redes/estacionamiento.db'
+ruta_modelo = '/home/redes/modelo_estacionamiento_ia.tflite' 
+
+DIAS = {
+    0: "Lunes", 1: "Martes", 2: "Miercoles", 3: "Jueves",
+    4: "Viernes", 5: "Sabado", 6: "Domingo"
+}
+
+MESES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+    7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+}
+
+# --- CONTROL DE CARGA DE IA
+print("[...] Cargando el cerebro ligero de la IA (.tflite) en la Raspberry Pi...")
+try:
+    # Carga limpia y directa de TFLite estandar
+    interpreter = tflite.Interpreter(model_path=ruta_modelo)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    print("IA TFLite cargada correctamente y lista para predecir.")
+    ia_disponible = True
+except Exception as e:
+    print(f"Alerta: No se pudo cargar el modelo TFLite. Motivo: {e}")
+    ia_disponible = False
+
+def iniciar_base_datos():
+    """Crea el archivo de la base de datos y la tabla si no existen."""
+    conexion = sqlite3.connect(archivo_db)
+    cursor = conexion.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS monitoreo (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dia TEXT,
+            mes TEXT,
+            anio INTEGER,
+            hora TEXT,
+            temp_z1 REAL,
+            hum_z1 REAL,
+            temp_z2 REAL,
+            hum_z2 REAL
+        )
+    ''')
+    conexion.commit()
+    conexion.close()
+
+def obtener_datos_tiempo_google():
+    """Obtiene el objeto datetime y textos del tiempo exacto desde internet usando Google."""
+    try:
+        respuesta = requests.get('https://google.com', timeout=3)
+        if respuesta.status_code == 200:
+            txt_fecha_gmt = respuesta.headers['Date']
+            formato_google = "%a, %d %b %Y %H:%M:%S GMT"
+            dt_utc = datetime.strptime(txt_fecha_gmt, formato_google)
+           
+            # Ajuste Chile Continental (UTC-4)
+            dt_chile = dt_utc - timedelta(hours=4)
+           
+            dia_nombre = DIAS[dt_chile.weekday()]
+            dia_num = dt_chile.day
+            mes_nombre = MESES[dt_chile.month]
+            anio = dt_chile.year
+            hora_completa = dt_chile.strftime("%H:%M:%S")
+           
+            pantalla_fecha = f"{dia_nombre} {dia_num} de {mes_nombre} {anio}"
+            dia_formato = f"{dia_nombre} {dia_num}"
+           
+            return dt_chile, dia_formato, mes_nombre, anio, hora_completa, pantalla_fecha
+           
+    except Exception:
+        return None, None, None, None, None, "Error de red"
+    return None, None, None, None, None, "Error de respuesta"
+
+def guardar_en_sqlite(dia, mes, anio, hora, t1, h1, t2, h2):
+    """Inserta una nueva fila de datos en la base de datos SQLite."""
+    try:
+        conexion = sqlite3.connect(archivo_db)
+        cursor = conexion.cursor()
+        cursor.execute('''
+            INSERT INTO monitoreo (dia, mes, anio, hora, temp_z1, hum_z1, temp_z2, hum_z2)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (dia, mes, anio, hora, float(t1), float(h1), float(t2), float(h2)))
+        conexion.commit()
+        conexion.close()
+    except Exception as e:
+        print(f"Alerta Base de Datos: No se pudo guardar. Motivo: {e}")
+
+def calcular_prediccion_en_vivo():
+    """Consulta los ultimos 10 datos de la BD y predice usando TensorFlow Lite."""
+    if not ia_disponible:
+        return "Modelo IA no disponible"
+    try:
+        conexion = sqlite3.connect(archivo_db)
+        df_reciente = pd.read_sql_query("SELECT temp_z1 FROM monitoreo ORDER BY id DESC LIMIT 10", conexion)
+        conexion.close()
+       
+        df_reciente = df_reciente.iloc[::-1]
+       
+        if len(df_reciente) < 10:
+            return "Recolectando datos minimos iniciales (se requieren 10)..."
+           
+        ultimos_10 = df_reciente[['temp_z1']].values
+       
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        ultimos_10_escalados = scaler.fit_transform(ultimos_10)
+       
+        X_input = np.array([ultimos_10_escalados], dtype=np.float32)
+        X_input = np.reshape(X_input, (X_input.shape[0], X_input.shape[1], 1))
+       
+        # --- PROCESO DE INFERENCIA EN TFLITE interpreter.set_tensor(input_details[0]['index'], X_input)
+        interpreter.invoke()
+        prediccion_escalada = interpreter.get_tensor(output_details[0]['index'])
+       
+        prediccion_real = scaler.inverse_transform(prediccion_escalada)
+        return f"{prediccion_real[0][0]:.2f} C"
+    except Exception as e:
+        return f"Error al procesar: {e}"
+
+# --- INICIO DEL PROGRAMA PRINCIPAL ---
+iniciar_base_datos()
+
+try:
+    arduino = serial.Serial(puerto_arduino, 9600, timeout=1)
+    time.sleep(2)
+   
+    print("=== SISTEMA CONTROLADOR HORARIO CON PREDICCION IA TFLITE ===")
+    print(f"Base de datos activa en: {archivo_db}")
+    print(f"Conectado mediante pines GPIO en el puerto: {puerto_arduino}\n")
+   
+    ultimo_estado_enviado = None
+   
+    while True:
+        resultado = obtener_datos_tiempo_google()
+       
+        if resultado[0] is not None:
+            dt_actual, dia, mes, anio, hora_txt, txt_pantalla = resultado
+           
+            hora_actual = dt_actual.hour
+            minuto_actual = dt_actual.minute
+           
+            if hora_actual == 11 and (25 <= minuto_actual < 40):
+                debe_apagar = True
+            else:
+                debe_apagar = False
+               
+            if debe_apagar and ultimo_estado_enviado != "APAGADO":
+                print(f"\n[{hora_txt}] [Maestro -> Esclavo] ORDEN: Iniciando pausa (11:25). Enviando senal de apagado...")
+                arduino.write(b'A')
+                ultimo_estado_enviado = "APAGADO"
+               
+            elif not debe_apagar and ultimo_estado_enviado != "ENCENDIDO":
+                print(f"\n[{hora_txt}] [Maestro -> Esclavo] ORDEN: Fin de la pausa (11:40). Activando sensores...")
+                ultimo_estado_enviado = "ENCENDIDO"
+
+            if debe_apagar:
+                print(f"[{hora_txt}] Modo Standby Activo: Filtro de seguridad activado (No se toman datos).", end="\r")
+                if arduino.in_waiting > 0:
+                    arduino.reset_input_buffer()
+                time.sleep(1)
+                continue
+           
+            arduino.write(b'E')
+            time.sleep(0.5)
+           
+            if arduino.in_waiting > 0:
+                linea = arduino.readline().decode('utf-8').strip()
+               
+                if linea == "SENSORES_APAGADOS":
+                    print(f"[{txt_pantalla} | {hora_txt}] [Esclavo] Confirmado: Esperando en modo reposo.")
+                elif linea == "ERROR_LECTURA":
+                    print(f"[{txt_pantalla} | {hora_txt}] [Esclavo] Alerta: Error al leer hardware real.")
+                elif linea:
+                    datos = linea.split(',')
+                    if len(datos) == 4:
+                        t1, h1, t2, h2 = datos
+                       
+                        print(f"\n[{txt_pantalla} | {hora_txt}] ------------------------------------")
+                        print(f"  LECTURA REAL  -> Z1: {t1} C | H1: {h1} %  ||  Z2: {t2} C | H2: {h2} %")
+                       
+                        guardar_en_sqlite(dia, mes, anio, hora_txt, t1, h1, t2, h2)
+                        print("Registro real guardado con exito en SQLite.")
+                       
+                        # Ejecutar la IA ligera de inmediato
+                        futuro_estimado = calcular_prediccion_en_vivo()
+                        print(f"PREVISION IA TFLITE -> Proxima temperatura (Z1): {futuro_estimado}")
+                        print("------------------------------------------------------------------")
+           
+            time.sleep(30)
+                       
+        else:
+            print("[Error de Red] No se pudo verificar la hora de Google.", end="\r")
+            time.sleep(2)
+                       
+except serial.SerialException:
+    print(f"Error Critico: Conexion fisica serial perdida.")
+except KeyboardInterrupt:
+    print("\nMonitoreo detenido por el usuario.")
+finally:
+    if 'arduino' in locals() and arduino.is_open:
+        arduino.close()
