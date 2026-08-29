@@ -1,0 +1,102 @@
+# Importar librerias
+import os # Crea carpetas, verifican si existen archivos y gestiona ruyas de almacenamiento en el disco.
+import matplotlib.pyplot as plt # Crea graficos y visualizaciones 2D.
+import numpy as np # Crea arreglo de datos, operaciones matematicas rapidas y transformacion ciclicas de tiempo.
+import pandas as pd # Manipula y analiza datos estructurados en forma de tabla.
+import tensorflow as tf # Plataforma principa de Inteligencia Artificial desarrollada por Google.
+from google.colab import files # Funcion especifica de Google Colab que permite subir archivos desde el computador hacia la nube de Colab o descargar archivos desde Colab al equipo. 
+from sklearn.preprocessing import MinMaxScaler # Herramienta de aprendizaje automatico que escala o normaliza los datos dentro de un rango especifico.
+from tensorflow.keras.layers import LSTM, Dense, Dropout # Bloques de construccion especificos para armar la red neuronal.
+from tensorflow.keras.models import Sequential # Define la estructura del modelo de red neuronal de tipo secuencial.
+# 1. Carga y preparacion de datos
+# Asegurate de subir tu archivo de datos (ejemplo: 'estacionamiento.csv')
+print("[...] Por favor, selecciona y sube tu archivo CSV:")
+uploaded = files.upload()
+
+# Obtener automaticamente el nombre del archivo subido
+archivo_csv = list(uploaded.keys())[0]
+print(f" Archivo detectado exitosamente: '{archivo_csv}'")
+
+# Cargar DataFrame
+df = pd.read_csv(archivo_csv)
+
+# Verificar nombres de columnas disponibles
+print("\nColumnas disponibles en el CSV:", list(df.columns))
+
+# Seleccionamos la columna relevante (por ejemplo, 'distancia')
+datos_entrenamiento = df[['distancia']].values
+
+# Escalar datos entre 0 y 1
+scaler = MinMaxScaler(feature_range=(0, 1))
+datos_escalados = scaler.fit_transform(datos_entrenamiento)
+
+# Crear ventanas de tiempo (usaremos los ultimos 10 registros para predecir)
+X_train = []
+y_train = []
+ventana = 10
+
+for i in range(ventana, len(datos_escalados)):
+  X_train.append(datos_escalados[i - ventana : i, 0])
+  y_train.append(datos_escalados[i, 0])
+
+X_train, y_train = np.array(X_train), np.array(y_train)
+
+# Reshape para la LSTM: (muestras, pasos de tiempo, caracteristicas)
+X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+print(" Datos estructurados correctamente para la LSTM.")
+# 2. Diseno y entrenamiento del modelo LSTM
+modelo = Sequential()
+modelo.add(
+    LSTM(units=50, return_sequences=True, input_shape=(X_train.shape[1], 1))
+)
+modelo.add(Dropout(0.2))
+modelo.add(LSTM(units=50, return_sequences=False))
+modelo.add(Dropout(0.2))
+modelo.add(Dense(units=1))  # Salida: Siguiente valor de distancia/tiempo
+
+modelo.compile(optimizer='adam', loss='mean_squared_error')
+
+print("\nIniciando entrenamiento de la IA para Estacionamiento...")
+historial = modelo.fit(X_train, y_train, epochs=20, batch_size=32)
+print("Entrenamiento completado")
+
+# Guardar modelo base Keras en formato .h5
+modelo.save('modelo_estacionamiento.h5')
+print("Archivo 'modelo_estacionamiento.h5' guardado.")
+# 3. Conversion a tflite nativo
+print("\n[...] Aplicando desenrollado (unroll=True) para compatibilidad TFLite...")
+
+modelo_antiguo = tf.keras.models.load_model('modelo_estacionamiento.h5')
+modelo_estatico = Sequential()
+
+for layer in modelo_antiguo.layers:
+  if isinstance(layer, tf.keras.layers.LSTM):
+    config = layer.get_config()
+    config['unroll'] = True 
+    nuevo_layer = tf.keras.layers.LSTM.from_config(config)
+    modelo_estatico.add(nuevo_layer)
+  else:
+    modelo_estatico.add(layer)
+
+# Fijar forma de entrada: (Batch=1, Pasos=10, Características=1)
+modelo_estatico.build(input_shape=(1, 10, 1))
+modelo_estatico.set_weights(modelo_antiguo.get_weights())
+
+# Convertir a TFLite
+converter = tf.lite.TFLiteConverter.from_keras_model(modelo_estatico)
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+
+tflite_model = converter.convert()
+
+nombre_tflite = 'modelo_estacionamiento.tflite'
+with open(nombre_tflite, 'wb') as f:
+  f.write(tflite_model)
+
+print(
+    f"Archivo '{nombre_tflite}' generado exitosamente sin dependencias"
+    ' Flex.'
+)
+# 4. Descarga automatica de archivos
+print("\nDescargando archivos para la Raspberry Pi...")
+files.download('modelo_estacionamiento.h5')
+files.download('modelo_estacionamiento.tflite')
