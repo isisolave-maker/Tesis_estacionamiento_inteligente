@@ -1,0 +1,88 @@
+import numpy as np # Libreria para el calculo numerico y matricial en Python.
+import pandas as pd #  Libreria por excelencia para la manipulacion y analisis
+de datos en formato de tabla (DataFrames).
+import matplotlib.pyplot as plt # Libreria que permite visualizar los datos a traves de graficos.
+import seaborn as sns # Libreria de visualizacion de datos estadisticos basada en Matplotlib.
+from google.colab import files # Modulo propio del entorno en la nube Google Colab.
+
+# 1. Cargar el archivo CSV
+print(''Por favor, sube tu archivo CSV:'')
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+
+# Leer dataset
+df = pd.read_csv(filename)
+
+print(f''\nTotal de registros leidos: {len(df)}'')
+
+# 2. Descartar las primeras 10 mediciones (Calibracion inicial del sensor)
+N_CALIBRACION = 10
+df_analisis = df.iloc[N_CALIBRACION:].copy()
+print(f''Registros tras eliminar las primeras {N_CALIBRACION} muestras de 
+calibracion: {len(df_analisis)}'')
+
+# 3. Definir las distancias reales (nominales) que evaluaste durante el
+experimento
+# MODIFICA esta lista con las distancias exactas que usaste en tu prueba en cm:
+DISTANCIAS_REALES = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+
+# Tolerancia en cm para agrupar lecturas alrededor de la distancia objetivo 
+(descarta transiciones al mover el objeto)
+TOLERANCIA = 3.0
+
+resultados = []
+
+plt.figure(figsize=(12, 6))
+
+print(''\n'' + ''=''*65)
+print('' ANALISIS DE PRECISION Y EXACTITUD POR DISTANCIA OBJETIVO'')
+print(''=''*65)
+
+# 4. Procesar cada distancia por separado
+for d_real in DISTANCIAS_REALES:
+    # Filtrar datos pertenecientes a la posicion fija 
+    (excluye momentos de movimiento/transicion)
+    segmento = df_analisis[(df_analisis['distancia'] >= d_real - TOLERANCIA) &
+                           (df_analisis['distancia'] <= d_real + TOLERANCIA)]
+                           ['distancia'].values
+
+    n_muestras = len(segmento)
+
+    if n_muestras > 0:
+        media_medida = np.mean(segmento)
+        desviacion_std = np.std(segmento) # Repetibilidad / Precision
+        mae = np.mean(np.abs(segmento - d_real)) # Error Absoluto Medio
+        rmse = np.sqrt(np.mean((segmento - d_real)**2)) # Error Cuadratico Medio
+        error_relativo_pct = (mae / d_real) * 100
+        exactitud_pct = max(0, 100 - error_relativo_pct)
+
+        resultados.append({
+            'Distancia Real (cm)': d_real,
+            'Muestras Validas': n_muestras,
+            'Promedio Medido (cm)': round(media_medida, 2),
+            'Desv. Estandar (cm)': round(desviacion_std, 3),
+            'MAE (cm)': round(mae, 3),
+            'RMSE (cm)': round(rmse, 3),
+            'Error Relativo (%)': round(error_relativo_pct, 2),
+            'Exactitud (%)': round(exactitud_pct, 2)
+        })
+
+        # Graficar densidad de cada grupo
+        sns.kdeplot(segmento, label=f'Real: {d_real} cm (Medido: 
+        {media_medida:.1f} cm)')
+
+# Convertir a DataFrame de resumen
+df_resumen = pd.DataFrame(resultados)
+
+# Mostrar tabla de resultados
+print(df_resumen.to_string(index=False))
+print("="*65)
+
+# Configuracion del grafico de distribuciones
+plt.title('Distribucion de Lecturas del Sensor HC-SR04 para Distintas Posiciones 
+Fijas')
+plt.xlabel('Distancia Medida por el Sensor (cm)')
+plt.ylabel('Densidad de Muestras')
+plt.grid(True, linestyle=':', alpha=0.6)
+plt.legend()
+plt.show()
