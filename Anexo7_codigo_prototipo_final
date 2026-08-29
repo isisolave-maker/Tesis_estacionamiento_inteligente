@@ -1,0 +1,762 @@
+import json # Codifica y decodifica las lecturas de datos en formato JSON.
+import os # Funciones para interactuar directamente con el sistema operativo.
+import sqlite3 # Permite interactuar con SQLite.
+import threading # Ejecuta multiples tareas al mismo tiempo, evitando que la interfaz se congele mientras el programa realiza otras operaciones. 
+import time # Proporciona funciones para manejar el tiempo.
+import tkinter as tk # Construye la interfaz grafica Tkinter.
+import urllib.request # Permite realizar peticiones HTTP a la web.
+import requests # Realiza peticiones HTTP a traves de internet.
+import serial # Sirve para gestionar la comunicacion serial entre dispositivos
+
+# CONFIGURACION GENERAL
+puerto_arduino = "/dev/ttyS0"  # O "/dev/ttyACM0"
+archivo_db = "estacionamiento_3sensores.db"
+
+# URL del endpoint en Google Colab / Ngrok
+URL_ENDPOINT_IA = "https://carpool-scalding-veteran.ngrok-free.dev/entrenar_ia"
+
+# --- CONFIGURACIÓN BLYNK ---
+BLYNK_AUTH_TOKEN = "xdxDTLNgLdnac6r4YzGm1qSjwxCUoCVI"  # Reemplaza con tu token de Blynk
+BLYNK_SERVER_URL = "https://blynk.cloud/external/api/update"
+
+INTERVALO_LECTURA = 30.0  # Lectura de sensores cada 30 segundos
+INTERVALO_ENVIO_IA_SEGUNDOS = (
+    600  # Frecuencia de envio a la IA cuando esten 3 ocupados (1 minuto)
+)
+
+DISTANCIA_MINIMA_VALIDA = 2.0  # cm
+DISTANCIA_UMBRAL_CM = 50.0  # cm
+MUESTRAS_REQUERIDAS = 4
+
+db_lock = threading.Lock()
+
+# FUNCIONES AUXILIARES DE BLYNK
+def enviar_datos_blynk(
+    estados, asignacion, tiempo_ia_val=0, servidor_activo=True
+):
+    """Envía actualizaciones individuales a Blynk en segundo plano."""
+
+    def _tarea_envio():
+        if BLYNK_AUTH_TOKEN == "TU_BLYNK_AUTH_TOKEN_AQUI":
+            print("BLYNK_AUTH_TOKEN no configurado, se omite el envío.")
+            return
+
+        e1_ocupado = 0 if estados[0] == "DISPONIBLE" else 1
+        e1_disponible = 1 if estados[0] == "DISPONIBLE" else 0
+
+        e2_ocupado = 0 if estados[1] == "DISPONIBLE" else 1
+        e2_disponible = 1 if estados[1] == "DISPONIBLE" else 0
+
+        e3_ocupado = 0 if estados[2] == "DISPONIBLE" else 1
+        e3_disponible = 1 if estados[2] == "DISPONIBLE" else 0
+
+        try:
+            val_v7 = round(float(tiempo_ia_val), 1) if tiempo_ia_val else 0
+        except (ValueError, TypeError):
+            val_v7 = 0
+
+        # V6 - ASIGNACIÓN
+        if asignacion is not None:
+            texto_v6 = f"Dirigirse al espacio {asignacion}"
+        else:
+            texto_v6 = "Estacionamiento lleno"
+
+        # V7 - TIEMPO IA
+        if tiempo_ia_val is None:
+        # Todos ocupados y esta llamada NO debe modificar V7
+            texto_v7 = None
+
+        else:
+            try:
+                val_v7 = round(float(tiempo_ia_val), 1)
+            except (ValueError, TypeError):
+                val_v7 = 0
+
+            if val_v7 == 0:
+                texto_v7 = "Hay espacios disponibles"
+            else:
+                texto_v7 = f"Proximo espacio libre en {val_v7} min"
+
+        # DATOS BLYNK
+        pines_valores = {
+            "v0": e1_ocupado,
+            "v1": e1_disponible,
+            "v2": e2_ocupado,
+            "v3": e2_disponible,
+            "v4": e3_ocupado,
+            "v5": e3_disponible,
+            "v6": texto_v6,
+        }
+
+        # V7 solo se manda cuando corresponde.
+        # Nunca se manda "Calculando..."
+        if texto_v7 is not None:
+            pines_valores["v7"] = texto_v7
+
+        with requests.Session() as s:
+            for pin, valor in pines_valores.items():
+                try:
+                    params = {
+                        "token": BLYNK_AUTH_TOKEN,
+                        pin: valor
+                    }
+
+                    r = s.get(
+                        BLYNK_SERVER_URL,
+                        params=params,
+                        timeout=2
+                    )
+
+                    if r.status_code != 200:
+                        print(
+                            f"Blynk rechazo {pin}={valor} -> HTTP "
+                            f"{r.status_code}: {r.text}"
+                        )
+
+                except Exception as e:
+                    print(f"Error enviando {pin} a Blynk: {e}")
+
+        print(
+            f"Blynk actualizado | "
+            f"E1:{e1_disponible} "
+            f"E2:{e2_disponible} "
+            f"E3:{e3_disponible} | "
+            f"V6={texto_v6}"
+            + (f" | V7={texto_v7}" if texto_v7 is not None else "")
+        )
+
+    threading.Thread(target=_tarea_envio, daemon=True).start()
+
+# 1. HORA OFICIAL DE CHILE DESDE INTERNET
+def obtener_tiempo_local():
+    dias_semana = {
+        0: "lunes",
+        1: "martes",
+        2: "miercoles",
+        3: "jueves",
+        4: "viernes",
+        5: "sabado",
+        6: "domingo",
+    }
+    meses_es = {
+        "01": "enero",
+        "02": "febrero",
+        "03": "marzo",
+        "04": "abril",
+        "05": "mayo",
+        "06": "junio",
+        "07": "julio",
+        "08": "agosto",
+        "09": "septiembre",
+        "10": "octubre",
+        "11": "noviembre",
+        "12": "diciembre",
+    }
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    try:
+        url = "http://worldtimeapi.org/api/timezone/America/Santiago"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            datetime_str = data["datetime"]
+
+            fecha_part, hora_part = datetime_str.split("T")
+            anio_s, mes_s, dia_s = fecha_part.split("-")
+            hora_txt = hora_part.split(".")[0]
+            day_of_week = data.get("day_of_week")
+
+            if day_of_week is not None:
+                nombre_dia = dias_semana.get(day_of_week, "")
+                fecha_formateada = f"{nombre_dia} {int(dia_s)} de {meses_es.get(mes_s, mes_s)} de {anio_s}"
+            else:
+                fecha_formateada = (
+                    f"{int(dia_s)} de {meses_es.get(mes_s, mes_s)} de {anio_s}"
+                )
+
+            return (
+                dia_s,
+                meses_es.get(mes_s, mes_s),
+                int(anio_s),
+                hora_txt,
+                fecha_formateada,
+            )
+
+    except Exception:
+        pass
+
+    try:
+        url_alt = "https://timeapi.io/api/time/current/zone?timeZone=America/Santiago"
+        req_alt = urllib.request.Request(url_alt, headers=headers)
+        with urllib.request.urlopen(req_alt, timeout=3) as response:
+            data = json.loads(response.read().decode())
+
+            dia_s = f"{data['day']:02d}"
+            mes_num = f"{data['month']:02d}"
+            mes_s = meses_es.get(mes_num, "enero")
+            anio_s = data["year"]
+            hora_txt = (
+                f"{data['hour']:02d}:{data['minute']:02d}:{data['seconds']:02d}"
+            )
+
+            day_of_week_str = data.get("dayOfWeek", "").lower()
+            m_dias = {
+                "monday": "lunes",
+                "tuesday": "martes",
+                "wednesday": "miercoles",
+                "thursday": "jueves",
+                "friday": "viernes",
+                "saturday": "sabado",
+                "sunday": "domingo",
+            }
+            nombre_dia = m_dias.get(day_of_week_str, "")
+
+            fecha_formateada = (
+                f"{nombre_dia} {int(dia_s)} de {mes_s} de {anio_s}"
+            )
+            return dia_s, mes_s, int(anio_s), hora_txt, fecha_formateada
+
+    except Exception:
+        pass
+
+    t_local = time.localtime()
+    hora_sistema = time.strftime("%H:%M:%S", t_local)
+    dia_sys = time.strftime("%d", t_local)
+    mes_sys = meses_es.get(time.strftime("%m", t_local), "enero")
+    anio_sys = t_local.tm_year
+
+    return (
+        dia_sys,
+        mes_sys,
+        anio_sys,
+        hora_sistema,
+        f"{dia_sys} de {mes_sys} de {anio_sys}",
+    )
+
+# 2. BASE DE DATOS LOCAL (.db)
+def guardar_db_3_sensores(dia, mes, anio, hora, d1, est1, d2, est2, d3, est3):
+    with db_lock:
+        try:
+            conexion = sqlite3.connect(archivo_db, timeout=10.0)
+            cursor = conexion.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS monitoreo_estacionamiento (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dia TEXT, mes TEXT, anio INTEGER, hora TEXT,
+                    dist_e1 REAL, estado_e1 TEXT,
+                    dist_e2 REAL, estado_e2 TEXT,
+                    dist_e3 REAL, estado_e3 TEXT
+                )
+            """)
+            cursor.execute(
+                """
+                INSERT INTO monitoreo_estacionamiento
+                (dia, mes, anio, hora, dist_e1, estado_e1, dist_e2, estado_e2, dist_e3, estado_e3)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    dia,
+                    mes,
+                    anio,
+                    hora,
+                    float(d1),
+                    est1,
+                    float(d2),
+                    est2,
+                    float(d3),
+                    est3,
+                ),
+            )
+
+            conexion.commit()
+            id_generado = cursor.lastrowid
+            conexion.close()
+            return id_generado
+        except Exception as e:
+            print(f"Error al guardar en BD: {e}")
+            return 0
+
+# 3. ENVIO DE BASE DE DATOS A LA IA (COLAB)
+def bucle_envio_ia(app_ref):
+    time.sleep(5)
+
+    headers = {
+        "ngrok-skip-browser-warning": "69420",
+        "User-Agent": "RaspberryPi-Client",
+    }
+
+    while True:
+        try:
+            if not app_ref.todos_ocupados():
+                time.sleep(5)
+                continue
+
+            elif os.path.exists(archivo_db):
+                print(
+                    "\n[...] 3 ESPACIOS OCUPADOS: ENVIANDO BASE DE DATOS A IA..."
+                )
+
+                with db_lock:
+                    with open(archivo_db, "rb") as f:
+                        archivos = {
+                            "file": (
+                                archivo_db,
+                                f,
+                                "application/octet-stream",
+                            )
+                        }
+
+                        print("[...] Conectando con Colab...")
+
+                        response = requests.post(
+                            URL_ENDPOINT_IA,
+                            files=archivos,
+                            headers=headers,
+                            timeout=30,
+                            verify=False,
+                        )
+
+                print(
+                    f"[...] Respuesta de Colab: HTTP {response.status_code}"
+                )
+
+                if response.status_code == 200:
+                    respuesta_json = response.json()
+
+                    print("\n RESPUESTA RECIBIDA DE LA IA:")
+                    print(
+                        json.dumps(
+                            respuesta_json,
+                            indent=4,
+                            ensure_ascii=False
+                        )
+                    )
+
+                    tiempo_val = None
+
+                    claves_posibles = [
+                        "minutos_faltantes_estimados",
+                        "tiempo_estimado_desocupar_minutos",
+                        "tiempo_estimado",
+                        "prediccion",
+                        "tiempo_restante",
+                        "tiempo",
+                        "minutos",
+                        "prediction",
+                        "time",
+                        "estimated_time",
+                    ]
+
+                    for clave in claves_posibles:
+                        if clave in respuesta_json:
+                            tiempo_val = respuesta_json[clave]
+                            print(
+                                f"Valor IA encontrado en '{clave}': "
+                                f"{tiempo_val}"
+                            )
+                            break
+
+                    if tiempo_val is None and isinstance(
+                        respuesta_json, dict
+                    ):
+                        valores = list(respuesta_json.values())
+
+                        if len(valores) > 0:
+                            tiempo_val = valores[0]
+
+                            print(
+                                f"No se encontro una clave conocida. "
+                                f"Usando primer valor: {tiempo_val}"
+                            )
+
+                    if tiempo_val is not None:
+                        try:
+                            val_num = float(tiempo_val)
+                            val_num = round(val_num, 1)
+                            app_ref.ultimo_tiempo_ia = val_num
+                            texto_mostrar = f"IA: Próximo espacio libre en aprox: {val_num} min"
+                        except (ValueError, TypeError):
+                            app_ref.ultimo_tiempo_ia = tiempo_val
+                            texto_mostrar = (
+                                f"IA: Proximo espacio libre en: {tiempo_val}"
+                            )
+                    else:
+                        texto_mostrar = "IA: Estimacion no disponible"
+                    # Actualizar GUI
+                    app_ref.root.after(
+                        0,
+                        lambda texto=texto_mostrar:
+                        app_ref.var_texto_ia.set(texto)
+                    )
+
+                    # Enviar el mismo valor a Blynk
+                    print(f"[DEBUG] Enviando a Blynk V7 = {app_ref.ultimo_tiempo_ia}")
+
+                    enviar_datos_blynk(
+                        app_ref.estados_actuales,
+                        None,
+                        tiempo_ia_val=app_ref.ultimo_tiempo_ia,
+                    )
+
+                else:
+                    print(
+                        f"Error HTTP {response.status_code} "
+                        f"desde Colab"
+                    )
+
+                    print(
+                        f"Respuesta de Colab: {response.text[:500]}"
+                    )
+
+        except requests.exceptions.Timeout:
+            print("TIMEOUT: Colab tardo mas de 30 segundos.")
+
+        except requests.exceptions.ConnectionError as e:
+            print(
+                f"ERROR DE CONEXION CON COLAB/NGROK: {e}"
+            )
+
+        except Exception as e:
+            print(
+                f"Error en comunicacion con IA: {e}"
+            )
+
+        # IMPORTANTE: 600 segundos = 10 minutos
+        time.sleep(INTERVALO_ENVIO_IA_SEGUNDOS)
+
+# 4. INTERFAZ GRAFICA Y CONTROL PRINCIPAL
+class EstacionamientoApp:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Monitor 3 Estacionamientos")
+        self.root.geometry("600x520")
+        self.root.configure(bg="#121212")
+
+        tk.Label(
+            root,
+            text="MONITOREO DE 3 ESTACIONAMIENTOS",
+            font=("Helvetica", 16, "bold"),
+            fg="#ffffff",
+            bg="#121212",
+        ).pack(pady=10)
+
+        frame_tarjetas = tk.Frame(root, bg="#121212")
+        frame_tarjetas.pack(pady=10)
+
+        self.cards, self.lbl_estados, self.lbl_dists = [], [], []
+
+        for i in range(3):
+            f = tk.Frame(
+                frame_tarjetas,
+                bg="#1e1e1e",
+                width=180,
+                height=180,
+                highlightbackground="#333",
+                highlightthickness=1,
+            )
+            f.pack_propagate(False)
+            f.grid(row=0, column=i, padx=5)
+
+            tk.Label(
+                f,
+                text=f"ESPACIO {i+1}",
+                font=("Helvetica", 11, "bold"),
+                fg="#888",
+                bg="#1e1e1e",
+            ).pack(pady=5)
+
+            lbl_est = tk.Label(
+                f,
+                text="DISPONIBLE",
+                font=("Helvetica", 11, "bold"),
+                fg="#fff",
+                bg="#28a745",
+                width=15,
+            )
+            lbl_est.pack(pady=5)
+
+            lbl_d = tk.Label(
+                f,
+                text="0 cm",
+                font=("Helvetica", 14, "bold"),
+                fg="#fff",
+                bg="#1e1e1e",
+            )
+            lbl_d.pack(pady=10)
+
+            self.cards.append(f)
+            self.lbl_estados.append(lbl_est)
+            self.lbl_dists.append(lbl_d)
+
+        # PANEL IA / ASIGNACIÓN
+        frame_ia = tk.Frame(root, bg="#2a2a3c", width=565, height=45)
+        frame_ia.pack_propagate(False)
+        frame_ia.pack(pady=8)
+
+        self.var_texto_ia = tk.StringVar(value="Verificando disponibilidad...")
+        self.lbl_ia = tk.Label(
+            frame_ia,
+            textvariable=self.var_texto_ia,
+            font=("Helvetica", 11, "bold"),
+            fg="#00e676",
+            bg="#2a2a3c",
+        )
+        self.lbl_ia.pack(expand=True)
+
+        # PANEL INFO / HORA
+        frame_info = tk.Frame(root, bg="#1e1e1e", width=565, height=60)
+        frame_info.pack_propagate(False)
+        frame_info.pack(pady=5)
+
+        self.lbl_info = tk.Label(
+            frame_info,
+            text="Iniciando sistema y consultando sensores...",
+            font=("Helvetica", 10),
+            fg="#ffc107",
+            bg="#1e1e1e",
+        )
+        self.lbl_info.pack(expand=True)
+
+        self.contadores_confirmacion = [0, 0, 0]
+        self.estados_actuales = ["DISPONIBLE", "DISPONIBLE", "DISPONIBLE"]
+
+        # Variable persistente para guardar la prediccion de la IA
+        self.ultimo_tiempo_ia = 0
+        self.ejecutando = True
+
+        threading.Thread(target=self.bucle_monitoreo, daemon=True).start()
+        threading.Thread(
+            target=bucle_envio_ia, args=(self,), daemon=True
+        ).start()
+
+    def todos_ocupados(self):
+        return all(
+            est in ["OCUPADO", "DETECTANDO"] for est in self.estados_actuales
+        )
+
+    def calcular_asignacion(self, estados):
+        prioridad_orden = [2, 1, 0]  # Prioridad: Espacio 3, luego 2, luego 1
+        for idx in prioridad_orden:
+            if estados[idx] == "DISPONIBLE":
+                return idx + 1
+        return None
+
+    def actualizar_texto_ia(self, texto):
+        self.var_texto_ia.set(texto)
+
+    def procesar_estado_espacio(self, idx, distancia):
+        if DISTANCIA_MINIMA_VALIDA < distancia < DISTANCIA_UMBRAL_CM:
+            self.contadores_confirmacion[idx] += 1
+        else:
+            self.contadores_confirmacion[idx] = 0
+
+        lecturas = self.contadores_confirmacion[idx]
+        if lecturas >= MUESTRAS_REQUERIDAS:
+            return "OCUPADO"
+        elif lecturas > 0:
+            return "DETECTANDO"
+        else:
+            return "DISPONIBLE"
+
+    def actualizar_gui(
+        self, dists, estados, latencia, db_id, hora_str, asignacion
+    ):
+        self.estados_actuales = estados
+        colores = {
+            "OCUPADO": "#dc3545",
+            "DISPONIBLE": "#28a745",
+            "DETECTANDO": "#ffc107",
+        }
+        texto_color = {
+            "DETECTANDO": "#000000",
+            "OCUPADO": "#ffffff",
+            "DISPONIBLE": "#ffffff",
+        }
+
+        for i in range(3):
+            est = estados[i]
+            d = dists[i]
+            txt_estado = (
+                est
+                if est != "DETECTANDO"
+                else f"DETECT. ({self.contadores_confirmacion[i]}/{MUESTRAS_REQUERIDAS})"
+            )
+
+            self.lbl_estados[i].config(
+                text=txt_estado, bg=colores[est], fg=texto_color[est]
+            )
+            self.lbl_dists[i].config(
+                text=f"{d:.1f} cm" if d > 0 else "Sin Lectura"
+            )
+
+        if asignacion is not None:
+            self.var_texto_ia.set(
+                f"ASIGNACION SUGERIDA: Dirijase al ESPACIO {asignacion}"
+            )
+        # FIX: la condicion estaba invertida (usaba "not"), lo que hacia
+        # que este mensaje nunca se mostrara, ya que asignacion es None
+        # justo cuando todos_ocupados() es True.
+        #elif self.todos_ocupados():
+            # FIX 2: antes este mensaje pisaba (cada 30s, en cada lectura
+            # de sensores) el texto que el hilo de la IA acababa de poner.
+            # Ahora siempre incluye la ultima estimacion conocida, asi no
+            # se "pierde" el dato de la IA mientras el estacionamiento
+            # sigue lleno.
+            #if self.ultimo_tiempo_ia:
+             #   self.var_texto_ia.set(
+              #      f"NO HAY ESPACIO | IA: Libre en"
+               #     f"{self.ultimo_tiempo_ia} min"
+                #)
+            #else:
+             #   self.var_texto_ia.set(
+              #      "¡ESTACIONAMIENTO LLENO! Calculando estimacion IA..."
+
+               # )
+
+        self.lbl_info.config(
+            text=(
+                f"Hora Chile: {hora_str}  |  UART: {latencia:.1f} ms  |  DB ID:"
+                f" #{db_id}"
+            )
+        )
+
+
+        if not self.todos_ocupados():
+            enviar_datos_blynk(
+                estados,
+                asignacion,
+                tiempo_ia_val=0
+            )
+        else:
+            enviar_datos_blynk(
+                estados,
+                asignacion,
+                tiempo_ia_val=None
+            )
+
+
+    def bucle_monitoreo(self):
+        try:
+            arduino = serial.Serial(puerto_arduino, 9600, timeout=2)
+            time.sleep(2)
+
+            while self.ejecutando:
+                dia, mes, anio, hora_txt, fecha_formateada = (
+                    obtener_tiempo_local()
+                )
+
+                arduino.reset_input_buffer()
+                t_inicio = time.perf_counter()
+
+                arduino.write(b"E")
+                linea = (
+                    arduino.readline()
+                    .decode("utf-8", errors="ignore")
+                    .strip()
+                )
+                latencia_ms = (time.perf_counter() - t_inicio) * 1000
+
+                if linea and linea != "SENSORES_APAGADOS":
+                    try:
+                        partes = linea.split(",")
+                        if len(partes) == 3:
+                            d1, d2, d3 = (
+                                float(partes[0]),
+                                float(partes[1]),
+                                float(partes[2]),
+                            )
+
+                            estados = [
+                                self.procesar_estado_espacio(0, d1),
+                                self.procesar_estado_espacio(1, d2),
+                                self.procesar_estado_espacio(2, d3),
+                            ]
+
+                            estacionamiento_asignado = self.calcular_asignacion(
+                                estados
+                            )
+
+                            db_id = guardar_db_3_sensores(
+                                dia,
+                                mes,
+                                anio,
+                                hora_txt,
+                                d1,
+                                estados[0],
+                                d2,
+                                estados[1],
+                                d3,
+                                estados[2],
+                            )
+
+                            datos_medicion = {
+                                "id": db_id,
+                                "fecha": fecha_formateada,
+                                "hora": hora_txt,
+                                "tiempo_medicion": f"{round(latencia_ms)} ms",
+                                "estacionamiento_asignado": (
+                                    f"ESPACIO {estacionamiento_asignado}"
+                                    if estacionamiento_asignado
+                                    else "NINGUNO (LLENO)"
+                                ),
+                                "mediciones": {
+                                    "estacionamiento_1": {
+                                        "distancia_cm": d1,
+                                        "estado": estados[0],
+                                    },
+                                    "estacionamiento_2": {
+                                        "distancia_cm": d2,
+                                        "estado": estados[1],
+                                    },
+                                    "estacionamiento_3": {
+                                        "distancia_cm": d3,
+                                        "estado": estados[2],
+                                    },
+                                },
+                            }
+
+                            print("\n--- LECTURA DE SENSORES (JSON) ---")
+                            print(
+                                json.dumps(
+                                    datos_medicion, indent=4, ensure_ascii=False
+                                )
+                            )
+
+                            self.root.after(
+                                0,
+                                self.actualizar_gui,
+                                [d1, d2, d3],
+                                estados,
+                                latencia_ms,
+                                db_id,
+                                hora_txt,
+                                estacionamiento_asignado,
+                            )
+
+                    except ValueError:
+                        print(
+                            f"[{hora_txt}] Error de formato al procesar linea:"
+                            f" '{linea}'"
+                        )
+                else:
+                    print(
+                        f"[{hora_txt}] Sin respuesta del Arduino o sensores"
+                        " apagados"
+                    )
+
+                time.sleep(INTERVALO_LECTURA)
+
+        except Exception as e:
+            print(f" Error en el puerto serie: {e}")
+
+# INICIO DE LA APLICACIÓN
+if __name__ == "__main__":
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    root = tk.Tk()
+    app = EstacionamientoApp(root)
+    root.mainloop()
